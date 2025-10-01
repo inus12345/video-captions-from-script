@@ -1,0 +1,77 @@
+paths:
+  video: "Mickey 17 (2025) 4K Recap.mp4"
+  script: "mickey17_2025_recap.txt"
+
+output:
+  ass: "mickey17_2025_recap.ass"
+  video: "Mickey 17 (2025) 4K Caption.mp4"
+  burn_in: true
+
+encode:
+  vcodec: libx264
+  crf: 16
+  preset: slow
+  tune: film
+  pix_fmt: yuv420p
+  audio_copy: true
+  extra_flags: "-movflags +faststart"
+
+layout:
+  max_line_words: 10
+
+style:
+  font: Arial
+  fontsize: 20
+  bold: true
+  italic: false
+  primary: "00FFFFFF"    # active word color
+  secondary: "00666666"  # dim upcoming words
+  outline: "00000000"
+  back: "32000000"
+  outline_w: 3
+  shadow_w: 0
+  align: 2
+  marginL: 50
+  marginR: 50
+  marginV: 60
+
+# Keep the very first lines now
+clean:
+  drop_title_lines: false
+
+# Alignment behavior
+align:
+  mode: auto              # auto | global | chunked
+  min_char_hit_ratio: 0.70  # accept global even if some tail chars are weak
+
+refine:
+  lead_ms: -150             # show words slightly early (negative is earlier)
+  max_shift_ms: 220         # clamp instantaneous global shift
+  highlight_linger_ms: 40   # small tail after each word's highlight (0..80 typical)
+
+advanced:
+  sample_rate: 16000
+  temp_audio: "temp_audio.wav"
+
+# Be a bit more lenient so quiet outros are detected
+utterance:
+  frame_ms: 30
+  hop_ms: 15
+  energy_thresh_db: -45     # was -35; lower (more negative) = more sensitive to quiet speech
+  min_pause_s: 0.6
+  max_utter_s: 20.0
+  slice_pad_s: 0.6
+  max_chars: 320
+  max_subchunk_s: 14.0
+
+sync:
+  # Correct MP4 edit-list start offsets so captions align from t=0
+  auto_stream_offset: true
+  # Optional manual nudge after auto (ms). Can be negative.
+  global_offset_ms: 0
+
+  # End fitting (new): stretch/shrink timeline to hit chosen end target
+  linear_warp: true
+  warp_target: speech_end    # speech_end | audio_end
+  end_margin_s: 0.35
+  max_warp_pct: 12.0         # allow up to ±12% total stretch/shrink
