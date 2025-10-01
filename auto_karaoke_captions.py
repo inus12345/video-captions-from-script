@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Forced-alignment karaoke captions (global-CTC first, chunked fallback):
+Forced-alignment karaoke captions (global-CTC first, chunked fallback) with drift control:
 - Global CTC alignment across the whole audio eliminates drift.
 - Chunked alignment remains as a robust fallback or opt-in mode.
 - Punctuation & word-boundary safe mapping (apostrophes/hyphens preserved).
 - A/V stream start-time offset correction via ffprobe (so subs start at 0).
-- **New:** End-to-end warp to the true end of speech/audio with configurable cap.
+- End-to-end warp to the true end of speech/audio with configurable cap.
+- Periodic audit re-sync in sliding windows (capped shift + scale, edge blending).
 - ASS output with per-word \k highlighting + slight linger for readability.
 
 Install:
@@ -28,7 +29,7 @@ _WORD_RE_DISPLAY = re.compile(r"[a-z0-9][a-z0-9'-]*", re.IGNORECASE)
 _BRACKET_LINE_RE = re.compile(r"^\s*\[.*?\]\s*$")
 _TITLE_HINT_RE   = re.compile(r"(full[- ]length recap|segment\s*\d+|intro|prologue|wrap[- ]?up)", re.I)
 
-def normspace(s:str)->str: 
+def normspace(s:str)->str:
     return re.sub(r"\s+"," ", s.strip())
 
 def normalize_unicode_punct(s: str) -> str:
@@ -40,7 +41,7 @@ def normalize_unicode_punct(s: str) -> str:
 
 def load_and_clean_script(path: str, drop_title_lines: bool = True) -> str:
     """
-    Keep narration only: drop [Segment ...] headers and (optionally) very-early title-ish lines,
+    Keep narration only: drop [Segment ...] headers and (optionally) early title-ish lines,
     then normalize punctuation and whitespace.
     """
     with open(path, "r", encoding="utf-8") as f:
@@ -48,13 +49,13 @@ def load_and_clean_script(path: str, drop_title_lines: bool = True) -> str:
     kept=[]
     for i, ln in enumerate(lines):
         raw = ln.strip()
-        if not raw: 
+        if not raw:
             continue
-        if _BRACKET_LINE_RE.match(raw): 
+        if _BRACKET_LINE_RE.match(raw):
             continue
         if drop_title_lines and i < 3 and (_TITLE_HINT_RE.search(raw) or raw.startswith("🎬")):
             continue
-        if not re.search(r"[A-Za-z]", raw): 
+        if not re.search(r"[A-Za-z]", raw):
             continue
         kept.append(raw)
     return normalize_unicode_punct(normspace(" ".join(kept)))
@@ -98,18 +99,18 @@ def normalize_for_labels(text: str, labels: List[str]) -> str:
     return s
 
 # ---------- shell / io ----------
-def _abspath(p): 
+def _abspath(p):
     return os.path.abspath(os.path.expanduser(p))
 
 def _must_exist(label,p):
-    if not os.path.isfile(p): 
+    if not os.path.isfile(p):
         raise FileNotFoundError(f"{label} not found: {p}")
 
 def run(cmd:str):
     print(f"\n$ {cmd}")
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(p.stdout)
-    if p.returncode!=0: 
+    if p.returncode!=0:
         raise RuntimeError(f"Command failed ({p.returncode}): {cmd}")
 
 # ---------- ffprobe A/V offset ----------
@@ -155,7 +156,7 @@ def detect_pauses(wav: torch.Tensor, sr: int, frame_ms=30, hop_ms=15,
                   energy_thresh_db=-35.0, min_pause_s=0.6, max_utter_s=20.0) -> List[Tuple[float,float]]:
     x = wav.numpy()
     frame = int(sr * frame_ms / 1000); hop = int(sr * hop_ms / 1000)
-    if frame <= 0 or hop <= 0: 
+    if frame <= 0 or hop <= 0:
         return [(0.0, len(x)/sr)]
     frames=[]
     for i in range(0, len(x)-frame+1, hop):
@@ -166,28 +167,25 @@ def detect_pauses(wav: torch.Tensor, sr: int, frame_ms=30, hop_ms=15,
 
     regions=[]; in_sp=False; s0=0.0
     for t, sp in zip(times, speech):
-        if sp and not in_sp: 
+        if sp and not in_sp:
             in_sp=True; s0=t
-        elif not sp and in_sp: 
+        elif not sp and in_sp:
             in_sp=False; regions.append((s0, t))
-    if in_sp: 
+    if in_sp:
         regions.append((s0, times[-1] + frame/sr))
-    if not regions: 
+    if not regions:
         return [(0.0, len(x)/sr)]
 
     # merge & cap length
     utt=[]; cs,ce = regions[0]
     for s,e in regions[1:]:
-        if s - ce < min_pause_s and (e - cs) < max_utter_s: 
-            ce=e
-        else: 
-            utt.append((cs,ce)); cs,ce = s,e
+        if s - ce < min_pause_s and (e - cs) < max_utter_s: ce=e
+        else: utt.append((cs,ce)); cs,ce = s,e
     utt.append((cs,ce))
 
     out=[]
     for s,e in utt:
-        if (e - s) <= max_utter_s: 
-            out.append((s,e))
+        if (e - s) <= max_utter_s: out.append((s,e))
         else:
             n = int(math.ceil((e - s)/max_utter_s))
             for k in range(n):
@@ -199,8 +197,7 @@ def detect_pauses(wav: torch.Tensor, sr: int, frame_ms=30, hop_ms=15,
 def words_to_chunks(script_words: List[str], utter_times: List[Tuple[float,float]]) -> List[List[str]]:
     total_dur = sum(max(0.01, e-s) for s,e in utter_times)
     total_words = len(script_words)
-    if total_dur <= 0 or total_words == 0: 
-        return [script_words]
+    if total_dur <= 0 or total_words == 0: return [script_words]
     raw_counts = [max(1, int(round(total_words * (e-s)/total_dur))) for (s,e) in utter_times]
     diff = sum(raw_counts) - total_words
     counts = raw_counts[:]
@@ -224,8 +221,7 @@ def words_to_chunks(script_words: List[str], utter_times: List[Tuple[float,float
 def autosubchunk(words_chunk: List[str], t0: float, t1: float,
                  max_chars: int = 320, max_sec: float = 14.0) -> List[Tuple[List[str], Tuple[float,float]]]:
     text = " ".join(words_chunk); nchar = len(text); dur = max(0.01, t1 - t0)
-    if nchar <= max_chars and dur <= max_sec: 
-        return [(words_chunk, (t0, t1))]
+    if nchar <= max_chars and dur <= max_sec: return [(words_chunk, (t0, t1))]
     mid = max(1, len(words_chunk)//2)
     return autosubchunk(words_chunk[:mid], t0, t0+dur/2, max_chars, max_sec) + \
            autosubchunk(words_chunk[mid:], t0+dur/2, t1, max_chars, max_sec)
@@ -306,7 +302,7 @@ def map_char_timings_to_words(ctc_text: str, char_times: np.ndarray, display_wor
     return words
 
 # ---------- ASS helpers ----------
-def duration_to_k_cs(d: float) -> int: 
+def duration_to_k_cs(d: float) -> int:
     return max(1, int(round(max(0.05, d)*100)))
 
 ASS_HEADER = """[Script Info]
@@ -344,6 +340,128 @@ def build_ass(aligned_words: List[Dict], style: dict, max_line_words: int)->str:
         lines.append(f"Dialogue: 0,{secs_to_ass(s)},{secs_to_ass(e)},Kara,,0000,0000,0000,,{text}")
     return "\n".join(lines)
 
+# ---------- periodic audit re-sync (sliding window) ----------
+def _least_squares_affine(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """
+    Fit y ≈ a*x + b by least squares. Returns (a, b).
+    """
+    A = np.vstack([x, np.ones_like(x)]).T
+    sol, *_ = np.linalg.lstsq(A, y, rcond=None)
+    a, b = sol
+    return float(a), float(b)
+
+def _tri_blend_weight(t: float, w_start: float, w_end: float, blend_s: float) -> float:
+    """
+    Triangular edge blend: 0 at window edges, 1 in the interior beyond 'blend_s'.
+    """
+    if blend_s <= 1e-6:
+        return 1.0
+    d = min(max(0.0, t - w_start), max(0.0, w_end - t))
+    return float(np.clip(d / blend_s, 0.0, 1.0))
+
+def _window_words(words: List[Dict], t0: float, t1: float) -> List[int]:
+    """
+    Return indices of words that intersect [t0, t1].
+    """
+    idxs=[]
+    for i,w in enumerate(words):
+        if w["end"] >= t0 and w["start"] <= t1:
+            idxs.append(i)
+    return idxs
+
+def _enforce_monotonic_bounds(words: List[Dict], audio_len: float):
+    """
+    Make timings monotonic and within [0, audio_len].
+    """
+    if not words: return
+    words[0]["start"] = max(0.0, min(audio_len, words[0]["start"]))
+    words[0]["end"]   = max(words[0]["start"]+1e-3, min(audio_len, words[0]["end"]))
+    for i in range(1, len(words)):
+        w_prev = words[i-1]; w = words[i]
+        w["start"] = max(w_prev["end"] + 1e-3, min(audio_len, w["start"]))
+        w["end"]   = max(w["start"] + 0.06,   min(audio_len, w["end"]))
+
+def audit_resync(
+    aligned_words: List[Dict],
+    emissions: torch.Tensor,
+    labels: List[str],
+    blank_id: int,
+    frame_dur: float,
+    audio_len: float,
+    cfg: Dict
+) -> List[Dict]:
+    """
+    Sliding-window self-check:
+    - For each window, re-align the window's text to the local emission slice.
+    - If median timing error > trigger, apply a capped affine (shift+scale) correction.
+    - Blend near window edges to avoid visible jumps.
+    """
+    A = cfg.get("audit", {})
+    if not bool(A.get("enable", True)) or not aligned_words:
+        return aligned_words
+
+    win_s       = float(A.get("win_s", 12.0))
+    hop_s       = float(A.get("hop_s", 6.0))
+    pad_s       = float(A.get("pad_s", 0.8))
+    max_shift_s = float(A.get("max_shift_ms", 180)) / 1000.0
+    max_scale   = float(A.get("max_scale_pct", 6.0)) / 100.0  # ±6%
+    trigger_s   = float(A.get("trigger_ms", 120)) / 1000.0
+    blend_s     = float(A.get("blend_ms", 400)) / 1000.0
+
+    T = emissions.shape[0]
+    words = [dict(w) for w in aligned_words]
+
+    t = max(0.0, words[0]["start"])
+    overall_end = min(audio_len, max(words[-1]["end"], 0.0))
+
+    while t < overall_end - 0.5:
+        w_start = t
+        w_end   = min(overall_end, t + win_s)
+        idxs = _window_words(words, w_start, w_end)
+        if len(idxs) >= 3:
+            sub = [words[i] for i in idxs]
+            sub_words = [w["word"] for w in sub]
+            sub_ctc   = normalize_for_labels(" ".join(sub_words), labels)
+
+            if sub_ctc:
+                ss = max(0.0, sub[0]["start"] - pad_s)
+                ee = min(audio_len, sub[-1]["end"] + pad_s)
+                fi0 = int(round(ss / frame_dur))
+                fi1 = int(round(ee / frame_dur)) + 1
+                fi0 = max(0, min(T-1, fi0))
+                fi1 = max(fi0+1, min(T, fi1))
+                em_slice = emissions[fi0:fi1]
+
+                try:
+                    char_times = align_ctc_slice(em_slice, labels, sub_ctc, blank_id, frame_dur, ss)
+                    new_local  = map_char_timings_to_words(sub_ctc, char_times, sub_words)
+                    if len(new_local) == len(sub):
+                        old_c = np.array([(w["start"]+w["end"])/2.0 for w in sub], dtype=np.float64)
+                        new_c = np.array([(w["start"]+w["end"])/2.0 for w in new_local], dtype=np.float64)
+                        err   = np.median(np.abs(new_c - old_c))
+
+                        if err > trigger_s:
+                            a, b = _least_squares_affine(old_c, new_c)
+                            a = float(np.clip(a, 1.0 - max_scale, 1.0 + max_scale))
+                            b = float(np.clip(b, -max_shift_s,  max_shift_s))
+
+                            # Apply affine with edge blending
+                            for k, wi in enumerate(idxs):
+                                ws, we = words[wi]["start"], words[wi]["end"]
+                                ns = a*ws + b
+                                ne = a*we + b
+                                center = 0.5*(ws + we)
+                                wgt = _tri_blend_weight(center, w_start, w_end, blend_s)
+                                words[wi]["start"] = (1.0 - wgt)*ws + wgt*ns
+                                words[wi]["end"]   = (1.0 - wgt)*we + wgt*ne
+                except Exception:
+                    pass  # ignore local failures
+
+        t += hop_s
+
+    _enforce_monotonic_bounds(words, audio_len)
+    return words
+
 # ---------- main ----------
 def main():
     ap=argparse.ArgumentParser(description="Forced-alignment karaoke captions (global-CTC first, chunked fallback)")
@@ -351,7 +469,7 @@ def main():
     args=ap.parse_args()
 
     cfg=_abspath(args.config); _must_exist("Config", cfg)
-    with open(cfg,"r",encoding="utf-8") as f: 
+    with open(cfg,"r",encoding="utf-8") as f:
         C=yaml.safe_load(f)
 
     video=_abspath(C["paths"]["video"]); script=_abspath(C["paths"]["script"])
@@ -366,7 +484,7 @@ def main():
     raw_text = load_and_clean_script(script, drop_title_lines=drop_titles)
     display_words = words_for_display(raw_text)
     if not display_words:
-        print("No usable words in script after cleaning."); 
+        print("No usable words in script after cleaning.")
         sys.exit(2)
 
     # audio
@@ -387,16 +505,15 @@ def main():
     # config: alignment behavior
     A = C.get("align", {})
     mode = str(A.get("mode", "auto")).lower()   # "auto" | "global" | "chunked"
-    min_char_hit_ratio = float(A.get("min_char_hit_ratio", 0.75))  # accept global if >= 75% chars timed
+    min_char_hit_ratio = float(A.get("min_char_hit_ratio", 0.75))  # accept global if >= threshold
     highlight_linger_ms = int(C.get("refine",{}).get("highlight_linger_ms", 40))  # small linger after end
 
-    # ---- compute a lenient VAD pass for sync targeting (find last spoken time) ----
+    # lenient VAD pass for sync targeting (find last spoken moment)
     U = C.get("utterance",{})
     vad_for_sync = detect_pauses(
         wav, sr,
         frame_ms=int(U.get("frame_ms", 30)),
         hop_ms=int(U.get("hop_ms", 15)),
-        # Be a bit more lenient than main VAD to catch quiet outro speech:
         energy_thresh_db=float(U.get("energy_thresh_db", -35.0)) - 5.0,
         min_pause_s=float(U.get("min_pause_s", 0.6)),
         max_utter_s=float(U.get("max_utter_s", 20.0))*2,
@@ -418,7 +535,7 @@ def main():
         for w in out:
             w["start"] = max(0.0, w["start"] + lead)
             w["end"]   = min(audio_len, w["end"] + lead + linger)
-            if w["end"] <= w["start"]: 
+            if w["end"] <= w["start"]:
                 w["end"] = w["start"] + 0.06
 
         # enforce monotonic non-overlapping
@@ -427,7 +544,7 @@ def main():
                 d = out[i-1]["end"] - out[i]["start"] + 1e-3
                 out[i]["start"] += d; out[i]["end"] += d
 
-        # --- improved linear warp to hit end target (speech_end or audio_end) ---
+        # end-warp to hit target (speech_end or audio_end) with cap
         if bool(S.get("linear_warp", True)) and len(out) >= 2:
             warp_target = str(S.get("warp_target", "speech_end")).lower()  # speech_end | audio_end
             end_margin  = float(S.get("end_margin_s", 0.35))
@@ -482,7 +599,7 @@ def main():
             min_pause_s=float(U.get("min_pause_s", 0.6)),
             max_utter_s=float(U.get("max_utter_s", 20.0)),
         )
-        if not pauses: 
+        if not pauses:
             pauses=[(0.0, audio_len)]
         word_chunks = words_to_chunks(display_words, pauses)
 
@@ -492,11 +609,9 @@ def main():
 
         out=[]
         for (t0,t1), wchunk in zip(pauses, word_chunks):
-            if not wchunk: 
-                continue
+            if not wchunk: continue
             for sub_words, (s0,s1) in autosubchunk(wchunk, t0, t1, max_chars, max_sub_sec):
-                if not sub_words: 
-                    continue
+                if not sub_words: continue
                 ss=max(0.0, s0 - pad_s); ee=min(audio_len, s1 + pad_s)
                 fi0=int(round(ss/frame_dur)); fi1=int(round(ee/frame_dur))+1
                 fi0=max(0, min(T-1, fi0)); fi1=max(fi0+1, min(T, fi1))
@@ -515,7 +630,7 @@ def main():
                     char_times = align_ctc_slice(em_slice, labels, sub_ctc, blank_id, frame_dur, ss)
                     words = map_char_timings_to_words(sub_ctc, char_times, sub_words)
                     out.extend(words)
-                except Exception as e:
+                except Exception:
                     # robust fallback: uniform pacing in (s0,s1)
                     dur=max(0.1, s1-s0); step=dur/len(sub_words); t=s0
                     for w in sub_words:
@@ -528,17 +643,27 @@ def main():
         return postprocess_words(out)
 
     # choose alignment path
-    A_mode = mode
-    if A_mode == "global":
+    if mode == "global":
         aligned_words = try_global() or run_chunked()
-    elif A_mode == "chunked":
+    elif mode == "chunked":
         aligned_words = run_chunked()
     else:  # "auto"
         aligned_words = try_global() or run_chunked()
 
     if not aligned_words:
-        print("Alignment produced no words."); 
+        print("Alignment produced no words.")
         sys.exit(2)
+
+    # ---- periodic alignment audit + local re-sync (NEW) ----
+    aligned_words = audit_resync(
+        aligned_words=aligned_words,
+        emissions=emissions,
+        labels=labels,
+        blank_id=blank_id,
+        frame_dur=frame_dur,
+        audio_len=audio_len,
+        cfg=C
+    )
 
     # ---- apply global A/V offset so ASS times match the VIDEO timeline ----
     sync_cfg = C.get("sync", {})
@@ -571,7 +696,7 @@ def main():
     max_line_words=int(C.get("layout",{}).get("max_line_words",8))
     ass_text = build_ass(aligned_words, style, max_line_words)
     os.makedirs(os.path.dirname(out_ass) or ".", exist_ok=True)
-    with open(out_ass,"w",encoding="utf-8") as f: 
+    with open(out_ass,"w",encoding="utf-8") as f:
         f.write(ass_text)
     print(f"[WRITE] ASS -> {out_ass}")
 
@@ -589,9 +714,9 @@ def main():
         print(f'  ffmpeg -y -i "{video}" -vf "ass={out_ass}" -c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p -c:a copy -movflags +faststart "{out_video}"')
 
     # cleanup
-    try: 
+    try:
         os.remove(tmp)
-    except OSError: 
+    except OSError:
         pass
 
 if __name__ == "__main__":

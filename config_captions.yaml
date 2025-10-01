@@ -41,8 +41,8 @@ clean:
 
 # Alignment behavior
 align:
-  mode: auto              # auto | global | chunked
-  min_char_hit_ratio: 0.70  # accept global even if some tail chars are weak
+  mode: auto               # auto | global | chunked
+  min_char_hit_ratio: 0.70 # accept global even if some tail chars are weak
 
 refine:
   lead_ms: -150             # show words slightly early (negative is earlier)
@@ -70,8 +70,19 @@ sync:
   # Optional manual nudge after auto (ms). Can be negative.
   global_offset_ms: 0
 
-  # End fitting (new): stretch/shrink timeline to hit chosen end target
+  # End fitting: stretch/shrink timeline to hit chosen end target
   linear_warp: true
   warp_target: speech_end    # speech_end | audio_end
   end_margin_s: 0.35
   max_warp_pct: 12.0         # allow up to ±12% total stretch/shrink
+
+# Periodic self-check + local re-sync
+audit:
+  enable: true
+  win_s: 12.0        # window length for local check
+  hop_s: 6.0         # step between windows (50% overlap)
+  pad_s: 0.8         # extra audio on each side of window when re-aligning
+  trigger_ms: 120    # only correct if median error > 120 ms
+  max_shift_ms: 180  # cap local shift magnitude
+  max_scale_pct: 6.0 # cap local stretch/shrink to ±6%
+  blend_ms: 400      # blend near window edges to avoid visible jumps
